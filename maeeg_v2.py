@@ -123,12 +123,12 @@ def positional_encoding(x, timesteps, embed_size):
 
 
 class TransformerEncoder(nn.Module):
-    def __init__(self, embed_size, transformer_embed_size, heads, forward_neuron, num_transformers):
+    def __init__(self, embed_size, transformer_embed_size, heads, forward_neuron, dropout, num_transformers):
         super().__init__()
         self.embed_size = embed_size
         self.input_conditioning = nn.Conv1d(in_channels=embed_size, out_channels=transformer_embed_size, kernel_size=1)
         self.transformer_blocks = nn.TransformerEncoder(encoder_layer=nn.TransformerEncoderLayer(d_model=transformer_embed_size, nhead=heads,
-                                                                                                 dim_feedforward=forward_neuron,),
+                                                                                                 dim_feedforward=forward_neuron, dropout=dropout),
                                                         num_layers=num_transformers)
         self.output_conditioning = nn.Conv1d(in_channels=transformer_embed_size, out_channels=embed_size, kernel_size=1)
 
@@ -194,7 +194,7 @@ class MAEEGReconstruction(nn.Module):
                                               downsample_size=downsample_size, kernel_size=kernel_size,
                                               dropout=dropout)
         self.transformer_encoder = TransformerEncoder(embed_size=embed_size, transformer_embed_size=transformer_embed_size, heads=heads, forward_neuron=forward_neuron,
-                                                      num_transformers=num_transformers)
+                                                      dropout=dropout, num_transformers=num_transformers)
         self.maeeg_decoder = MAEEGConvDecoder(input_channel=embed_size, output_channel=input_channel,
                                               upsample_size=downsample_size, kernel_size=kernel_size,
                                               dropout=dropout, output_size=output_size)
@@ -229,7 +229,7 @@ class MAEEGReconstructionV2(nn.Module):
                                               downsample_size=downsample_size, kernel_size=kernel_size,
                                               dropout=dropout)
         self.transformer_encoder = TransformerEncoder(embed_size=embed_size, transformer_embed_size=transformer_embed_size, heads=heads, forward_neuron=forward_neuron,
-                                                      num_transformers=num_transformers)
+                                                      dropout=dropout, num_transformers=num_transformers)
         self.maeeg_decoder = MAEEGConvDecoder(input_channel=embed_size, output_channel=input_channel,
                                               upsample_size=downsample_size, kernel_size=kernel_size,
                                               dropout=dropout, output_size=output_size)
@@ -316,7 +316,7 @@ class MAEEGClassification(nn.Module):
                                               downsample_size=downsample_size, kernel_size=kernel_size,
                                               dropout=dropout)
         self.transformer_encoder = TransformerEncoder(embed_size=embed_size, transformer_embed_size=transformer_embed_size, heads=heads, forward_neuron=forward_neuron,
-                                                      num_transformers=num_transformers)
+                                                      dropout=dropout, num_transformers=num_transformers)
         self.classifier = BinaryClassifier(fc_neuron=fc_neuron, dropout=dropout_classifier)
         self.use_transformer = use_transformer
 
@@ -353,7 +353,7 @@ class MAEEGClassificationV2(nn.Module):
                                               downsample_size=downsample_size, kernel_size=kernel_size,
                                               dropout=dropout)
         self.transformer_encoder = TransformerEncoder(embed_size=embed_size, transformer_embed_size=transformer_embed_size, heads=heads,
-                                                      forward_neuron=forward_neuron, num_transformers=num_transformers)
+                                                      dropout=dropout, forward_neuron=forward_neuron, num_transformers=num_transformers)
         self.classifier = BinaryClassifierV2(dropout_classifier)
         self.use_transformer = use_transformer
 

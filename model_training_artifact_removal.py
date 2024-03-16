@@ -5,33 +5,140 @@ import numpy as np
 from sklearn.decomposition import FastICA
 
 class EarlyStopping:
-    def __init__(self, patience, delta):
+    def __init__(self, patience, delta, val_type="loss"):
         self.patience = patience
         self.delta = delta
+        self.val_type = val_type
         self.counter = 0
         self.best_score = None
         self.best_params = None
         self.early_stop = False
 
-    def __call__(self, val_loss, model):
-        if self.best_score is None:
-            self.best_score = val_loss
-            self.best_params = model.state_dict()
-        elif val_loss > self.best_score + self.delta:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_score = val_loss
-            self.best_params = model.state_dict()
-            self.counter = 0
+    def __call__(self, val, model):
+        if self.val_type == "loss":
+            if self.best_score is None:
+                self.best_score = val
+                self.best_params = model.state_dict()
+            elif val > self.best_score + self.delta:
+                self.counter += 1
+                if self.counter >= self.patience:
+                    self.early_stop = True
+            else:
+                self.best_score = val
+                self.best_params = model.state_dict()
+                self.counter = 0
+        elif self.val_type == "acc":
+            if self.best_score is None:
+                self.best_score = val
+                self.best_params = model.state_dict()
+            elif val < self.best_score + self.delta:
+                self.counter += 1
+                if self.counter >= self.patience:
+                    self.early_stop = True
+            else:
+                self.best_score = val
+                self.best_params = model.state_dict()
+                self.counter = 0
 
 
-def self_prediction_mask_and_manual_artifact_removal(model, x_train, x_valid, x_removed_train, x_removed_valid,
-                                                     lr=0.01, lamb=0.5, num_epochs=20, batch=64, patience=5,
-                                                     delta=0.01, loss_fn=nn.MSELoss(), shuffle=True, verbose=0):
+def self_prediction_mask(model, x_train, x_valid, lr=0.01, weight_decay=0, num_epochs=20,
+                         batch=64, patience=5, delta=0.01, loss_fn=nn.MSELoss(),
+                         shuffle=True, verbose=0):
     """
-    Function to train MAEEG model by self-prediction with validation, filtering out frequencies.
+    Function to train MAEEG model by self-prediction with masking method.
+    """
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if not torch.is_tensor(x_train):
+        x_train = torch.Tensor(x_train)
+    x_train = x_train.to(device)
+
+    if not torch.is_tensor(x_valid):
+        x_valid = torch.Tensor(x_valid)
+    x_valid = x_valid.to(device)
+
+    model = model.to(device)
+
+    no_samples = x_train.shape[0]
+    no_iter_per_epoch = math.ceil(no_samples/batch)
+    no_valid_samples = x_valid.shape[0]
+    no_valid_loops = math.ceil(no_valid_samples / batch)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    early_stopping = EarlyStopping(patience=patience, delta=delta)
+
+    best_train_loss = float("inf")
+    best_valid_loss = float("inf")
+
+    for epoch in range(num_epochs):
+        if shuffle:
+            random_index = torch.randperm(no_samples)
+            x_train = x_train[random_index]
+        for j in range(no_iter_per_epoch):
+            model.train()
+            out_mask = model.forward_mask(x_train[batch*j:batch*(j+1)])
+            x_origin = x_train[batch*j:batch*(j+1)]
+
+            loss = loss_fn(out_mask, x_origin)
+
+            # Calculate gradient
+            loss.backward()
+
+            # Update weights
+            optimizer.step()
+
+            # Reset gradient
+            optimizer.zero_grad()
+
+            if j == no_iter_per_epoch - 1:
+                model.eval()
+                train_loss_list = []
+                for k in range(no_iter_per_epoch):
+                    train_out_mask = model.forward_mask(x_train[batch * k: batch * (k + 1)])
+                    train_origin = x_train[batch * k: batch * (k + 1)]
+
+                    train_loss = loss_fn(train_out_mask, train_origin)
+                    train_loss = train_loss.cpu()
+                    train_loss = train_loss.detach().numpy()
+                    train_loss_list.append(train_loss)
+                ave_train_loss = sum(train_loss_list) / len(train_loss_list)
+
+                # Validation
+                valid_loss_list = []
+                for k in range(no_valid_loops):
+                    valid_out_mask = model.forward_mask(x_valid[batch * k: batch * (k + 1)])
+                    valid_origin = x_valid[batch * k: batch * (k + 1)]
+
+                    valid_loss = loss_fn(valid_out_mask, valid_origin)
+                    valid_loss = valid_loss.cpu()
+                    valid_loss = valid_loss.detach().numpy()
+                    valid_loss_list.append(valid_loss)
+                ave_valid_loss = sum(valid_loss_list) / len(valid_loss_list)
+
+                early_stopping(val=ave_valid_loss, model=model)
+
+                if ave_valid_loss + delta < best_valid_loss:
+                    best_train_loss = ave_train_loss
+                    best_valid_loss = ave_valid_loss
+
+                if verbose == 1:
+                    print(f"Epoch {epoch+1}/{num_epochs}: train_loss = {ave_train_loss}, valid_loss = {ave_valid_loss}")
+
+        if early_stopping.early_stop:
+            model.load_state_dict(early_stopping.best_params)
+            print("Early stopping.")
+            break
+
+    return best_train_loss, best_valid_loss
+
+
+
+
+
+def self_prediction_artifact_removal(model, x_train, x_valid, x_removed_train, x_removed_valid,
+                                     lr=0.01, weight_decay=0, num_epochs=20, batch=64, patience=5, delta=0.01,
+                                     loss_fn=nn.MSELoss(), shuffle=True, verbose=0):
+    """
+    Function to train MAEEG model by self-prediction with single artifact removal method.
     """
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -57,7 +164,7 @@ def self_prediction_mask_and_manual_artifact_removal(model, x_train, x_valid, x_
     no_iter_per_epoch = math.ceil(no_samples/batch)
     no_valid_samples = x_valid.shape[0]
     no_valid_loops = math.ceil(no_valid_samples / batch)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     early_stopping = EarlyStopping(patience=patience, delta=delta)
 
     best_train_loss = float("inf")
@@ -69,15 +176,11 @@ def self_prediction_mask_and_manual_artifact_removal(model, x_train, x_valid, x_
             x_train = x_train[random_index]
             x_removed_train = x_removed_train[random_index]
         for j in range(no_iter_per_epoch):
+            model.train()
             out_filter = model(x_train[batch*j:batch*(j+1)])
             x_filter = x_removed_train[batch*j:batch*(j+1)]
 
-            out_mask = model.forward_mask(x_train[batch*j:batch*(j+1)])
-            x_origin = x_train[batch*j:batch*(j+1)]
-
-            loss_filter = loss_fn(out_filter, x_filter)
-            loss_mask = loss_fn(out_mask, x_origin)
-            loss = lamb * loss_mask + (1 - lamb) * loss_filter
+            loss = loss_fn(out_filter, x_filter)
 
             # Calculate gradient
             loss.backward()
@@ -89,16 +192,13 @@ def self_prediction_mask_and_manual_artifact_removal(model, x_train, x_valid, x_
             optimizer.zero_grad()
 
             if j == no_iter_per_epoch - 1:
+                model.eval()
                 train_loss_list = []
                 for k in range(no_iter_per_epoch):
                     train_out_filter = model(x_train[batch * k: batch * (k + 1)])
                     train_filter = x_removed_train[batch * k: batch * (k + 1)]
 
-                    train_out_mask = model.forward_mask(x_train[batch * k: batch * (k + 1)])
-                    train_origin = x_train[batch * k: batch * (k + 1)]
-
-                    train_loss = lamb * loss_fn(train_out_mask, train_origin) + (1 - lamb) * loss_fn(train_out_filter,
-                                                                                                     train_filter)
+                    train_loss = loss_fn(train_out_filter, train_filter)
                     train_loss = train_loss.cpu()
                     train_loss = train_loss.detach().numpy()
                     train_loss_list.append(train_loss)
@@ -110,16 +210,13 @@ def self_prediction_mask_and_manual_artifact_removal(model, x_train, x_valid, x_
                     valid_out_filter = model(x_valid[batch * k: batch * (k + 1)])
                     valid_filter = x_removed_valid[batch * k: batch * (k + 1)]
 
-                    valid_out_mask = model.forward_mask(x_valid[batch * k: batch * (k + 1)])
-                    valid_origin = x_valid[batch * k: batch * (k + 1)]
-
-                    valid_loss = lamb * loss_fn(valid_out_mask, valid_origin) + (1-lamb) * loss_fn(valid_out_filter, valid_filter)
+                    valid_loss = loss_fn(valid_out_filter, valid_filter)
                     valid_loss = valid_loss.cpu()
                     valid_loss = valid_loss.detach().numpy()
                     valid_loss_list.append(valid_loss)
                 ave_valid_loss = sum(valid_loss_list) / len(valid_loss_list)
 
-                early_stopping(val_loss=ave_valid_loss, model=model)
+                early_stopping(val=ave_valid_loss, model=model)
 
                 if ave_valid_loss + delta < best_valid_loss:
                     best_train_loss = ave_train_loss
@@ -137,12 +234,123 @@ def self_prediction_mask_and_manual_artifact_removal(model, x_train, x_valid, x_
 
 
 
+def self_prediction_multiple_artifact_removal(model, x_train, x_valid, x_removed_train, x_removed_valid,
+                                              lr=0.01, weight_decay=0, num_epochs=20, batch=64, patience=5, delta=0.01,
+                                              loss_fn=nn.MSELoss(), shuffle=True, verbose=0):
+    """
+    Function to train MAEEG model by self-prediction with multiple artifact removal method.
+    """
+
+    assert isinstance(x_removed_train, (list, tuple)) and isinstance(x_removed_valid, (list, tuple)), \
+        ("x_removed_train and x_removed_valid should be list or tuple.")
+
+    assert len(x_removed_train) == len(x_removed_valid), \
+        ("x_removed_train and x_removed_valid should have the same size.")
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if not torch.is_tensor(x_train):
+        x_train = torch.Tensor(x_train)
+    x_train = x_train.to(device)
+
+    if not torch.is_tensor(x_valid):
+        x_valid = torch.Tensor(x_valid)
+    x_valid = x_valid.to(device)
+
+    for i in range(len(x_removed_train)):
+        if not torch.is_tensor(x_removed_train[i]):
+            x_removed_train[i] = torch.Tensor(x_removed_train[i])
+        x_removed_train[i] = x_removed_train[i].to(device)
+
+        if not torch.is_tensor(x_removed_valid[i]):
+            x_removed_valid[i] = torch.Tensor(x_removed_valid[i])
+        x_removed_valid[i] = x_removed_valid[i].to(device)
+
+    model = model.to(device)
+
+    no_samples = x_train.shape[0]
+    no_iter_per_epoch = math.ceil(no_samples/batch)
+    no_valid_samples = x_valid.shape[0]
+    no_valid_loops = math.ceil(no_valid_samples / batch)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    early_stopping = EarlyStopping(patience=patience, delta=delta)
+
+    best_train_loss = float("inf")
+    best_valid_loss = float("inf")
+
+    for epoch in range(num_epochs):
+        if shuffle:
+            random_index = torch.randperm(no_samples)
+            x_train = x_train[random_index]
+            x_removed_train = [x[random_index] for x in x_removed_train]
+        for j in range(no_iter_per_epoch):
+            model.train()
+            out_filter = model(x_train[batch*j:batch*(j+1)])
+
+            loss = 0
+            for k in range(len(x_removed_train)):
+                x_filter = x_removed_train[k][batch*j:batch*(j+1)]
+                loss = loss + loss_fn(out_filter, x_filter)
+
+            # Calculate gradient
+            loss.backward()
+
+            # Update weights
+            optimizer.step()
+
+            # Reset gradient
+            optimizer.zero_grad()
+
+            if j == no_iter_per_epoch - 1:
+                model.eval()
+                train_loss_list = []
+                for k in range(no_iter_per_epoch):
+                    train_out_filter = model(x_train[batch * k: batch * (k + 1)])
+
+                    train_loss = 0
+                    for m in range(len(x_removed_train)):
+                        train_filter = x_removed_train[m][batch * k: batch * (k + 1)]
+                        train_loss = train_loss + loss_fn(train_out_filter, train_filter)
+                    train_loss = train_loss.cpu()
+                    train_loss = train_loss.detach().numpy()
+                    train_loss_list.append(train_loss)
+                ave_train_loss = sum(train_loss_list) / len(train_loss_list)
+
+                # Validation
+                valid_loss_list = []
+                for k in range(no_valid_loops):
+                    valid_out_filter = model(x_valid[batch * k: batch * (k + 1)])
+
+                    valid_loss = 0
+                    for m in range(len(x_removed_valid)):
+                        valid_filter = x_removed_valid[m][batch * k: batch * (k + 1)]
+                        valid_loss = valid_loss + loss_fn(valid_out_filter, valid_filter)
+                    valid_loss = valid_loss.cpu()
+                    valid_loss = valid_loss.detach().numpy()
+                    valid_loss_list.append(valid_loss)
+                ave_valid_loss = sum(valid_loss_list) / len(valid_loss_list)
+
+                early_stopping(val=ave_valid_loss, model=model)
+
+                if ave_valid_loss + delta < best_valid_loss:
+                    best_train_loss = ave_train_loss
+                    best_valid_loss = ave_valid_loss
+
+                if verbose == 1:
+                    print(f"Epoch {epoch+1}/{num_epochs}: train_loss = {ave_train_loss}, valid_loss = {ave_valid_loss}")
+
+        if early_stopping.early_stop:
+            model.load_state_dict(early_stopping.best_params)
+            print("Early stopping.")
+            break
+
+    return best_train_loss, best_valid_loss
+
 
 
 def classifier_train(model, x_train, y_train, lr=0.01, num_epochs=20, batch=64,
                      loss_fn=nn.BCELoss(), shuffle=True, verbose=0):
     """
-    Function to train classifier.
+    Function to train MAEEG classifier.
     """
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -203,9 +411,12 @@ def classifier_train(model, x_train, y_train, lr=0.01, num_epochs=20, batch=64,
 
 
 
-def classifier_train_valid(model, x_train, y_train, x_valid, y_valid, lr=0.01,
+def classifier_train_valid(model, x_train, y_train, x_valid, y_valid, lr=0.01, weight_decay=1e-4,
                            num_epochs=20, batch=64, loss_fn=nn.BCELoss(), use_early_stopping=True,
-                           patience=5, delta=0.01, shuffle=True, verbose=0):
+                           patience=5, delta=0.01, val_type="acc", shuffle=True, verbose=0):
+    """
+    Function to train MAEEG classifier with validation.
+    """
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if not torch.is_tensor(x_train):
@@ -230,8 +441,8 @@ def classifier_train_valid(model, x_train, y_train, x_valid, y_valid, lr=0.01,
     no_iter_per_epoch = math.ceil(no_samples/batch)
     no_valid_samples = x_valid.shape[0]
     no_valid_loops = math.ceil(no_valid_samples / batch)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    early_stopping = EarlyStopping(patience=patience, delta=delta)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    early_stopping = EarlyStopping(patience=patience, delta=delta, val_type=val_type)
 
     best_train_loss = float("inf")
     best_valid_loss = float("inf")
@@ -244,6 +455,7 @@ def classifier_train_valid(model, x_train, y_train, x_valid, y_valid, lr=0.01,
             x_train = x_train[random_index]
             y_train = y_train[random_index]
         for j in range(no_iter_per_epoch):
+            model.train()
             out = model(x_train[batch*j:batch*(j+1)])
             loss = loss_fn(out, y_train[batch*j:batch*(j+1)])
 
@@ -256,7 +468,9 @@ def classifier_train_valid(model, x_train, y_train, x_valid, y_valid, lr=0.01,
             # Reset gradient
             optimizer.zero_grad()
 
+            model.eval()
             if j == no_iter_per_epoch - 1:
+                model.eval()
                 train_loss_list = []
                 train_acc_list = []
                 for k in range(no_iter_per_epoch):
@@ -297,9 +511,17 @@ def classifier_train_valid(model, x_train, y_train, x_valid, y_valid, lr=0.01,
                 ave_valid_acc = sum(valid_acc_list) / len(valid_acc_list)
 
                 if use_early_stopping:
-                    early_stopping(val_loss=ave_valid_loss, model=model)
+                    if val_type == "loss":
+                        early_stopping(val=ave_valid_loss, model=model)
+                    elif val_type == "acc":
+                        early_stopping(val=ave_valid_acc, model=model)
 
-                if ave_valid_loss + delta < best_valid_loss:
+                if val_type == "loss" and (ave_valid_loss + delta < best_valid_loss):
+                    best_train_loss = ave_train_loss
+                    best_train_acc = ave_train_acc
+                    best_valid_loss = ave_valid_loss
+                    best_valid_acc = ave_valid_acc
+                elif val_type == "acc" and (ave_valid_acc + delta > best_valid_acc):
                     best_train_loss = ave_train_loss
                     best_train_acc = ave_train_acc
                     best_valid_loss = ave_valid_loss
@@ -319,24 +541,6 @@ def classifier_train_valid(model, x_train, y_train, x_valid, y_valid, lr=0.01,
     return best_train_loss, best_train_acc, best_valid_loss, best_valid_acc
 
 
-# def remove_frequency_component(x, freq_min, freq_max):
-#     """
-#     Function to remove frequencies out of the range.
-#     """
-#
-#     try:
-#         if torch.is_tensor(x):
-#             x = x.numpy()
-#         print(x)
-#         x_fft = np.fft.rfft(x, axis=-1)
-#
-#         x_fft[:, :, :freq_min] = 0
-#         x_fft[:, :, freq_max + 1:] = 0
-#         x_ifft = np.fft.irfft(x_fft)
-#         return x_ifft
-#     except:
-#         print("freq_min or freq_max is out of range.")
-
 def remove_frequency_component(x, freq_min, freq_max):
     """
     Function to remove frequencies out of the range.
@@ -351,26 +555,15 @@ def remove_frequency_component(x, freq_min, freq_max):
     x_ifft = np.fft.irfft(x_fft)
     return x_ifft
 
-def remove_frequency_component_(x, freq_min, freq_max):
-    """
-    Function to remove frequencies out of the range.
-    """
-
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    if not torch.is_tensor(x):
-        x = torch.Tensor(x)
-    x = x.to(device)
-    x_fft = torch.fft.rfft(x, axis=-1)
-
-    x_fft[:, :, :freq_min] = 0
-    x_fft[:, :, freq_max + 1:] = 0
-    x_ifft = torch.fft.irfft(x_fft)
-    return x_ifft
 
 
 def ica_and_frequency_removal(x, freq_min, freq_max, n_components=None, algorithm='parallel',
                               whiten='unit-variance', fun='logcosh', fun_args=None, max_iter=200,
                               tol=0.0001, w_init=None, whiten_solver='svd', random_state=None):
+    """
+    Function to apply ICA and frequency removal to EEG.
+    """
+
     if torch.is_tensor(x):
         x = x.cpu()
         x = x.detach().numpy()
@@ -395,3 +588,29 @@ def ica_and_frequency_removal(x, freq_min, freq_max, n_components=None, algorith
     x_inverse = x_inverse.reshape((batch, time_len, num_channel))
     x_inverse = x_inverse.transpose(0, 2, 1)
     return x_inverse
+
+
+def standardize_eeg(x, scaler, is_train=False):
+    """
+    Function to standardize EEG.
+    """
+    num_windows, num_channels, t_steps = x.shape
+    if is_train:
+        x_copy = x.copy()
+        scaler_fit_eeg(x_copy, scaler)
+    x = np.transpose(x, (0, 2, 1))
+    x = x.reshape((-1, num_channels))
+    x = scaler.transform(x)
+
+    x = x.reshape((num_windows, t_steps, num_channels))
+    x = np.transpose(x, (0, 2, 1))
+    return x
+
+def scaler_fit_eeg(x, scaler):
+    """
+    Function to let scaler fit EEG.
+    """
+    num_windows, num_channels, t_steps = x.shape
+    x = np.transpose(x, (0, 2, 1))
+    x = x.reshape((-1, num_channels))
+    scaler.fit(x)
